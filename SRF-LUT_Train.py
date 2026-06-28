@@ -1,10 +1,3 @@
-# v9.8-psnr-boost-no-consistency
-# 基于 v9.8-psnr-boost-no-consistency-save-direct 修改。
-# 当前训练损失：loss_y、loss_bri_stat、loss_rgb_light、loss_rgb_mse、loss_cbcr、loss_sat_stat、loss_ctr_range、loss_id。
-# 已关闭 consistency loss 和 stable gain。
-# 已取消训练过程中保存 BEST 直接输出图 PNG，仅保存 BEST LUT 的 .npy 和 .cube 文件。
-# 所有训练日志写入 txt 文件，不在命令行中显示；保留训练计时输出。
-
 from __future__ import annotations
 from typing import Optional, Tuple
 from pathlib import Path
@@ -229,6 +222,104 @@ def save_cube(lut_rgb: np.ndarray, path: str, tag: str):
 
 
 
+
+def load_best_lut_from_npy(lut: LUT3D, npy_path: Path, device: torch.device) -> None:
+    """Load a saved [N, N, N, 3] BEST LUT array back into the LUT3D module."""
+    if not npy_path.is_file():
+        raise FileNotFoundError(f"BEST LUT npy file does not exist: {npy_path}")
+
+    lut_rgb = np.load(str(npy_path))
+    if lut_rgb.ndim != 4 or lut_rgb.shape[-1] != 3:
+        raise ValueError(
+            f"Unexpected BEST LUT shape {lut_rgb.shape}; expected [N, N, N, 3]."
+        )
+
+    grid = torch.from_numpy(lut_rgb).permute(3, 0, 1, 2).contiguous()
+    expected_shape = tuple(lut.lut().shape)
+    if tuple(grid.shape) != expected_shape:
+        raise ValueError(
+            f"BEST LUT shape {tuple(grid.shape)} does not match model shape {expected_shape}."
+        )
+
+    with torch.no_grad():
+        lut.lut().copy_(grid.to(device=device, dtype=lut.lut().dtype))
+
+
+def save_output_tensor_as_png(output: torch.Tensor, save_path: Path) -> None:
+    """Save a [1, 3, H, W] or [3, H, W] tensor in [0, 1] as an RGB PNG."""
+    image = output.detach().clamp(0, 1)
+    if image.ndim == 4:
+        if image.shape[0] != 1:
+            raise ValueError(f"Expected batch size 1 for saving, got shape {tuple(image.shape)}")
+        image = image[0]
+    if image.ndim != 3 or image.shape[0] != 3:
+        raise ValueError(f"Expected [3, H, W] RGB tensor, got shape {tuple(image.shape)}")
+
+    array = (
+        image.permute(1, 2, 0)
+        .cpu()
+        .numpy()
+        .clip(0.0, 1.0)
+    )
+    array = np.rint(array * 255.0).astype(np.uint8)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(array, mode="RGB").save(str(save_path), format="PNG")
+
+
+def apply_best_lut_to_all_sources(
+    lut: LUT3D,
+    dataset: Dataset,
+    mode: str,
+    mode_tag: str,
+    tag: str,
+    lut_size: int,
+    out_dir: Path,
+    device: torch.device,
+    logger: FileLogger,
+) -> tuple[Path, int]:
+    """
+    Reload the saved BEST LUT and apply it to every source image.
+
+    Multi-source mode preserves the source folder's relative subdirectory structure.
+    All outputs are saved as lossless PNG files.
+    """
+    best_npy_path = out_dir / f"BEST_{mode_tag}_{tag}_N{lut_size}.npy"
+    load_best_lut_from_npy(lut, best_npy_path, device)
+
+    applied_dir = out_dir / f"APPLIED_{mode_tag}_{tag}_N{lut_size}"
+    applied_dir.mkdir(parents=True, exist_ok=True)
+
+    if mode == "multi_src_single_ref":
+        if not isinstance(dataset, MultiSrcSingleRefDataset):
+            raise TypeError("Expected MultiSrcSingleRefDataset in multi-source mode.")
+        source_entries = [
+            (source_path, source_path.relative_to(dataset.src_root))
+            for source_path in dataset.src_files
+        ]
+    else:
+        if not isinstance(dataset, SinglePairDataset):
+            raise TypeError("Expected SinglePairDataset in single-pair mode.")
+        source_entries = [(dataset.src_path, Path(dataset.src_path.name))]
+
+    logger.log(f"[APPLY] best_lut: {best_npy_path}")
+    logger.log(f"[APPLY] output_dir: {applied_dir}")
+    logger.log(f"[APPLY] source_count: {len(source_entries)}")
+
+    lut.eval()
+    saved_count = 0
+    with torch.no_grad():
+        for index, (source_path, relative_path) in enumerate(source_entries, start=1):
+            source = PairedFolder._read_rgb(source_path).unsqueeze(0).to(device).clamp(0, 1)
+            output = lut(source).clamp(0, 1)
+
+            save_path = applied_dir / relative_path.with_suffix(".png")
+            save_output_tensor_as_png(output, save_path)
+            saved_count += 1
+            logger.log(f"[APPLY] {index}/{len(source_entries)} OK: {source_path} -> {save_path}")
+
+    logger.log(f"[APPLY] completed: {saved_count}/{len(source_entries)} images saved")
+    return applied_dir, saved_count
+
 def contrast_range_loss(y_out: torch.Tensor, y_ref: torch.Tensor) -> torch.Tensor:
     v_out = y_out.reshape(y_out.shape[0], -1)
     v_ref = y_ref.reshape(y_ref.shape[0], -1)
@@ -437,8 +528,24 @@ def main():
     total_start_time = time.perf_counter()
 
     try:
-        loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=args.num_workers, drop_last=True)
-        it = iter(loader)
+        # single_pair 仍使用原有单样本 DataLoader。
+        # multi_src_single_ref 将全部样本预加载到 CPU；每个训练步依次计算所有 src，
+        # 对数据项损失取算术平均后反向传播，避免不同图像随机抽样造成的单图损失波动。
+        if mode == "multi_src_single_ref":
+            loader = None
+            it = None
+            full_src_samples = []
+            for sample_index in range(len(dataset)):
+                src_cpu, ref_cpu, sample_name = dataset[sample_index]
+                full_src_samples.append((
+                    src_cpu.unsqueeze(0).contiguous(),
+                    ref_cpu.unsqueeze(0).contiguous(),
+                    [sample_name],
+                ))
+        else:
+            loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=args.num_workers, drop_last=True)
+            it = iter(loader)
+            full_src_samples = None
 
         logger.log(f"[INFO] mode: {mode}")
         logger.log(f"[INFO] src: {src_path}")
@@ -447,6 +554,7 @@ def main():
         logger.log(f"[INFO] out_dir: {out_dir}")
         logger.log(f"[INFO] log_file: {log_path}")
         logger.log(f"[INFO] device: {device}")
+        logger.log("[INFO] optimization: full-src mean loss per step" if mode == "multi_src_single_ref" else "[INFO] optimization: single-pair loss per step")
 
 
         N = args.lut_size
@@ -542,64 +650,130 @@ def main():
         for step in range(1, max_steps + 1):
             step_start_time = time.perf_counter()
 
-            (src, ref, name), it = _next_batch(it, loader)
-
-            src = src.to(device).clamp(0, 1)
-            ref = ref.to(device).clamp(0, 1)
-
-            if use_stable_gain:
-                g0 = stable_gain_from_name(name[0], gain_min, gain_max)
-                src_in = (src * g0).clamp(0, 1)
+            if mode == "multi_src_single_ref":
+                step_samples = full_src_samples
             else:
-                src_in = src
+                single_batch, it = _next_batch(it, loader)
+                step_samples = [single_batch]
 
-            out = lut(src_in).clamp(0, 1)
-
-            ycc_out = rgb_to_ycbcr_bt601(out)
-            ycc_ref = rgb_to_ycbcr_bt601(ref)
-
-            Y_out, CbCr_out = ycc_out[:, 0:1], ycc_out[:, 1:3]
-            Y_ref, CbCr_ref = ycc_ref[:, 0:1], ycc_ref[:, 1:3]
-
-            wy = conservative_y_weight(Y_ref)
-            loss_y = (charbonnier(Y_out - Y_ref) * wy).mean()
-            loss_bri_stat = brightness_stat_loss_light(Y_out, Y_ref)
-            loss_rgb_light = charbonnier(out - ref).mean()
-            loss_rgb_mse = F.mse_loss(out, ref)
-            loss_cbcr = charbonnier(CbCr_out - CbCr_ref).mean()
-
-            loss_sat_stat, s_mean_out = masked_saturation_stat_loss(out, ref)
-            loss_ctr_range = contrast_range_loss(Y_out, Y_ref)
-
-            loss_id = lut.identity_loss()
+            sample_count = len(step_samples)
+            if sample_count == 0:
+                raise RuntimeError("No training samples are available for the current step.")
 
             w_id = schedule_weight(step, max_steps, w_id_start, w_id_end, id_warmup_end, id_anneal_end)
             w_cons_cbcr = 0.0
-            loss_cons_cbcr = torch.zeros((), device=device)
+            loss_cons_cbcr_value = 0.0
 
-            loss = (
-                w_y * loss_y
-                + w_bri_stat * loss_bri_stat
-                + w_rgb_light * loss_rgb_light
-                + w_rgb_mse * loss_rgb_mse
-                + w_cbcr * loss_cbcr
-                + w_sat_stat * loss_sat_stat
-                + w_ctr_range * loss_ctr_range
-                + w_id * loss_id
-            )
-
+            # Accumulate gradients of the arithmetic mean over all src images.
+            # Backward is executed once per image with a 1/M scale, which is exactly
+            # equivalent to constructing one large mean-loss graph, but uses less GPU memory.
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+
+            sums = {
+                "data_loss": 0.0,
+                "y": 0.0,
+                "bri_stat": 0.0,
+                "rgb": 0.0,
+                "rgb_mse": 0.0,
+                "cbcr": 0.0,
+                "sat": 0.0,
+                "ctr": 0.0,
+                "y_mean_out": 0.0,
+                "y_mean_ref": 0.0,
+                "y_p95_out": 0.0,
+                "y_p95_ref": 0.0,
+                "s_mean": 0.0,
+            }
+            mu_out_sum = np.zeros(3, dtype=np.float64)
+            sample_names = []
+
+            for src_cpu, ref_cpu, name in step_samples:
+                src = src_cpu.to(device, non_blocking=True).clamp(0, 1)
+                ref = ref_cpu.to(device, non_blocking=True).clamp(0, 1)
+                sample_name = name[0] if isinstance(name, (list, tuple)) else str(name)
+                sample_names.append(sample_name)
+
+                if use_stable_gain:
+                    g0 = stable_gain_from_name(sample_name, gain_min, gain_max)
+                    src_in = (src * g0).clamp(0, 1)
+                else:
+                    src_in = src
+
+                out = lut(src_in).clamp(0, 1)
+
+                ycc_out = rgb_to_ycbcr_bt601(out)
+                ycc_ref = rgb_to_ycbcr_bt601(ref)
+                Y_out, CbCr_out = ycc_out[:, 0:1], ycc_out[:, 1:3]
+                Y_ref, CbCr_ref = ycc_ref[:, 0:1], ycc_ref[:, 1:3]
+
+                wy = conservative_y_weight(Y_ref)
+                loss_y_i = (charbonnier(Y_out - Y_ref) * wy).mean()
+                loss_bri_stat_i = brightness_stat_loss_light(Y_out, Y_ref)
+                loss_rgb_light_i = charbonnier(out - ref).mean()
+                loss_rgb_mse_i = F.mse_loss(out, ref)
+                loss_cbcr_i = charbonnier(CbCr_out - CbCr_ref).mean()
+                loss_sat_stat_i, s_mean_out_i = masked_saturation_stat_loss(out, ref)
+                loss_ctr_range_i = contrast_range_loss(Y_out, Y_ref)
+
+                data_loss_i = (
+                    w_y * loss_y_i
+                    + w_bri_stat * loss_bri_stat_i
+                    + w_rgb_light * loss_rgb_light_i
+                    + w_rgb_mse * loss_rgb_mse_i
+                    + w_cbcr * loss_cbcr_i
+                    + w_sat_stat * loss_sat_stat_i
+                    + w_ctr_range * loss_ctr_range_i
+                )
+
+                (data_loss_i / sample_count).backward()
+
+                sums["data_loss"] += float(data_loss_i.detach().item())
+                sums["y"] += float(loss_y_i.detach().item())
+                sums["bri_stat"] += float(loss_bri_stat_i.detach().item())
+                sums["rgb"] += float(loss_rgb_light_i.detach().item())
+                sums["rgb_mse"] += float(loss_rgb_mse_i.detach().item())
+                sums["cbcr"] += float(loss_cbcr_i.detach().item())
+                sums["sat"] += float(loss_sat_stat_i.detach().item())
+                sums["ctr"] += float(loss_ctr_range_i.detach().item())
+                sums["y_mean_out"] += float(Y_out.mean().detach().item())
+                sums["y_mean_ref"] += float(Y_ref.mean().detach().item())
+                sums["y_p95_out"] += float(torch.quantile(Y_out.flatten(), 0.95).detach().item())
+                sums["y_p95_ref"] += float(torch.quantile(Y_ref.flatten(), 0.95).detach().item())
+                sums["s_mean"] += float(s_mean_out_i.detach().item())
+                mu_out_sum += out.mean(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64)
+
+            # LUT-only regularization is identical for every source. Adding it once after
+            # the averaged data loss is mathematically identical to averaging total losses.
+            loss_id = lut.identity_loss()
+            regularization_loss = w_id * loss_id
+            regularization_loss.backward()
             opt.step()
 
-            ecbcr = ema_cbcr.update(float(loss_cbcr.item()))
-            ebri = ema_bri.update(float(loss_y.item()))
-            ebri_stat = ema_bri_stat.update(float(loss_bri_stat.item()))
-            ergb = ema_rgb.update(float(loss_rgb_light.item()))
-            ergb_mse = ema_rgb_mse.update(float(loss_rgb_mse.item()))
-            ectr = ema_ctr.update(float(loss_ctr_range.item()))
-            esat = ema_sat.update(float(loss_sat_stat.item()))
-            econs = ema_cons.update(float(loss_cons_cbcr.item()))
+            inv_m = 1.0 / sample_count
+            loss_y_value = sums["y"] * inv_m
+            loss_bri_stat_value = sums["bri_stat"] * inv_m
+            loss_rgb_light_value = sums["rgb"] * inv_m
+            loss_rgb_mse_value = sums["rgb_mse"] * inv_m
+            loss_cbcr_value = sums["cbcr"] * inv_m
+            loss_sat_stat_value = sums["sat"] * inv_m
+            loss_ctr_range_value = sums["ctr"] * inv_m
+            s_mean_out_value = sums["s_mean"] * inv_m
+            y_mean_out = sums["y_mean_out"] * inv_m
+            y_mean_ref = sums["y_mean_ref"] * inv_m
+            y_p95_out = sums["y_p95_out"] * inv_m
+            y_p95_ref = sums["y_p95_ref"] * inv_m
+            mu_out = mu_out_sum * inv_m
+            mean_data_loss = sums["data_loss"] * inv_m
+            loss_value = mean_data_loss + float(regularization_loss.detach().item())
+
+            ecbcr = ema_cbcr.update(loss_cbcr_value)
+            ebri = ema_bri.update(loss_y_value)
+            ebri_stat = ema_bri_stat.update(loss_bri_stat_value)
+            ergb = ema_rgb.update(loss_rgb_light_value)
+            ergb_mse = ema_rgb_mse.update(loss_rgb_mse_value)
+            ectr = ema_ctr.update(loss_ctr_range_value)
+            esat = ema_sat.update(loss_sat_stat_value)
+            econs = ema_cons.update(loss_cons_cbcr_value)
 
             score = (
                 score_w_cbcr * ecbcr
@@ -617,35 +791,51 @@ def main():
                 save_best(step, best_score)
 
             if step % log_every == 0:
-                y_mean_out = Y_out.mean().detach().cpu().item()
-                y_mean_ref = Y_ref.mean().detach().cpu().item()
-                y_p95_out = torch.quantile(Y_out.flatten(), 0.95).detach().cpu().item()
-                y_p95_ref = torch.quantile(Y_ref.flatten(), 0.95).detach().cpu().item()
-                mu_out = out.mean(dim=(0, 2, 3)).detach().cpu().numpy()
                 step_elapsed = time.perf_counter() - step_start_time
                 total_elapsed = time.perf_counter() - total_start_time
+                name_text = f"ALL_SRC[{sample_count}]" if mode == "multi_src_single_ref" else sample_names[0]
 
                 logger.log(
                     f"[{step:4d}/{max_steps}] mode={mode_tag} "
-                    f"loss={loss.item():.4f} score={score:.4f} best={best_score:.4f} "
-                    f"CbCr={loss_cbcr.item():.4f} "
-                    f"Y={loss_y.item():.4f} BriStat={loss_bri_stat.item():.4f} RGB={loss_rgb_light.item():.4f} RGB_MSE={loss_rgb_mse.item():.6f} "
-                    f"SatStat={loss_sat_stat.item():.4f} CtrRange={loss_ctr_range.item():.4f} "
-                    f"ConsCbCr={loss_cons_cbcr.item():.4f}@{w_cons_cbcr:.4f} "
+                    f"loss={loss_value:.4f} mean_data_loss={mean_data_loss:.4f} score={score:.4f} best={best_score:.4f} "
+                    f"CbCr={loss_cbcr_value:.4f} "
+                    f"Y={loss_y_value:.4f} BriStat={loss_bri_stat_value:.4f} RGB={loss_rgb_light_value:.4f} RGB_MSE={loss_rgb_mse_value:.6f} "
+                    f"SatStat={loss_sat_stat_value:.4f} CtrRange={loss_ctr_range_value:.4f} "
+                    f"ConsCbCr={loss_cons_cbcr_value:.4f}@{w_cons_cbcr:.4f} "
                     f"id={loss_id.item():.4f}@{w_id:.4f} "
                     f"ema(CbCr/Y/BriStat/RGB/RGBmse/Ctr/Sat/Cons)=({ecbcr:.4f}/{ebri:.4f}/{ebri_stat:.4f}/{ergb:.4f}/{ergb_mse:.6f}/{ectr:.4f}/{esat:.4f}/{econs:.4f}) "
                     f"Ymean(out/ref)=({y_mean_out:.4f}/{y_mean_ref:.4f}) "
                     f"Yp95(out/ref)=({y_p95_out:.4f}/{y_p95_ref:.4f}) "
-                    f"Smean={float(s_mean_out):.4f} mu_out={mu_out} name={name[0]} "
+                    f"Smean={s_mean_out_value:.4f} mu_out={mu_out} name={name_text} "
                     f"step_time={format_seconds(step_elapsed)} total_time={format_seconds(total_elapsed)}"
                 )
 
-        total_elapsed = time.perf_counter() - total_start_time
-        logger.log(f"Done. Best step={best_step}, best score={best_score:.6f}")
+        training_elapsed = time.perf_counter() - total_start_time
+        logger.log(f"Training done. Best step={best_step}, best score={best_score:.6f}")
         logger.log("Best LUT files:")
         logger.log(f" - {out_dir / f'BEST_{mode_tag}_{args.tag}_N{N}.cube'}")
         logger.log(f" - {out_dir / f'BEST_{mode_tag}_{args.tag}_N{N}.npy'}")
-        logger.log(f"Training total time: {format_seconds(total_elapsed)} ({total_elapsed:.3f} seconds)")
+        logger.log(f"Training time: {format_seconds(training_elapsed)} ({training_elapsed:.3f} seconds)")
+
+        apply_start_time = time.perf_counter()
+        applied_output_dir, applied_count = apply_best_lut_to_all_sources(
+            lut=lut,
+            dataset=dataset,
+            mode=mode,
+            mode_tag=mode_tag,
+            tag=args.tag,
+            lut_size=N,
+            out_dir=out_dir,
+            device=device,
+            logger=logger,
+        )
+        apply_elapsed = time.perf_counter() - apply_start_time
+        total_elapsed = time.perf_counter() - total_start_time
+
+        logger.log(f"LUT application time: {format_seconds(apply_elapsed)} ({apply_elapsed:.3f} seconds)")
+        logger.log(f"Applied output count: {applied_count}")
+        logger.log(f"Applied output directory: {applied_output_dir}")
+        logger.log(f"Total time: {format_seconds(total_elapsed)} ({total_elapsed:.3f} seconds)")
         logger.log(f"Log saved to: {log_path}")
 
     finally:
